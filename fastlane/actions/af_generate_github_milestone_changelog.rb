@@ -11,55 +11,115 @@ module Fastlane
     # - Commit, push and submit the pull request
 
     class AfGenerateGithubMilestoneChangelogAction < Action
-      def self.markdown_for_changelog_section (section, items)
+      def self.english_join(array = nil)
+        return "" if array.nil? or array.length == 0
+        return array[0] if array.length == 1
+        array[0..-2].join(", ") + " and " + array[-1]
+      end
+      
+      def self.markdown_for_changelog_section (github_owner, github_repository, api_token, section, issues)
         changelog = "\n#### #{section}\n"
-        items.each do |item|
-          changelog << "* #{item["title"]}\n"
-          changelog << " * Fixed by [#{item["user"]["login"]}](#{item["user"]["html_url"]}) in [##{item["number"]}](#{item["html_url"]}).\n"
+        issues.each do |issue|
+          committers = getCommittersForIssue(github_owner,github_repository, api_token, issue)
+          
+          formatted_comitters = Array.new
+          committers.each do |committer|
+            formatted_comitters << "[#{committer["login"]}](#{committer["html_url"]})"
+          end
+          
+          changelog << "* #{issue["title"]}\n"
+          changelog << " * Fixed by #{english_join(formatted_comitters)} in [##{issue["number"]}](#{issue["html_url"]}).\n"
         end
         return changelog
       end
+      
+      def self.getResponseForURL(url, api_token)
+        uri = URI(url)
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+
+        # Create Request
+        req =  Net::HTTP::Get.new(uri)
+        req.add_field "Authorization", "Basic #{Base64.strict_encode64(api_token)}" if api_token != nil
+        req.add_field "Accept", "application/vnd.github.v3+json"
+        begin
+          httpResponse = http.request(req)
+          begin
+            case httpResponse.code.to_i
+              when 200..299
+                response = JSON.parse(httpResponse.body)
+              when 400..499 
+                response = JSON.parse(httpResponse.body)
+                raise "Error (#{response.code}): #{response["message"]}".red
+              else
+                Helper.log.info "Status Code: #{httpResponse.code} Body: #{httpResponse.body}"
+                raise "Error with request".red
+            end
+            
+          rescue
+
+          end
+        rescue => ex
+          raise "Error fetching remote file: #{ex}".red
+        end
+        return response
+      end
+      
+      def self.getIssuesForMilestone (github_owner, github_repository, api_token, milestone)
+        url = "https://api.github.com/search/issues?q=repo:#{github_owner}/#{github_repository}+milestone:#{milestone}+state:closed"
+        
+        response = getResponseForURL(url, api_token)
+        return response["items"]
+      end
+      
+      def self.getCommittersForIssue(github_owner, github_repository, api_token, issue)
+        if issue.has_key?("pull_request")
+          url = "https://api.github.com/repos/#{github_owner}/#{github_repository}/pulls/#{issue["number"]}/commits"
+
+         commits = getResponseForURL(url, api_token)
+         
+         committers = Array.new
+         commits.each do |pull_request|
+           committer = pull_request["committer"]
+           if committers.include?(committer) == false
+             committers << committer
+           end
+         end
+         return committers
+        else
+          return [issue["user"]]
+        end
+      end
+      
       
       def self.run(params)
         require 'net/http'
         require 'fileutils'
         
-        url = "https://api.github.com/search/issues?q=repo%3A#{params[:github_owner]}%2F#{params[:github_repository]}+milestone%3A#{params[:milestone]}+state%3Aclosed"
+        issues = getIssuesForMilestone(params[:github_owner], params[:github_repository], params[:api_token], params[:milestone])
         
-        begin
-          response = Net::HTTP.get(URI(url))
-          begin
-            response = JSON.parse(response) # try to parse and see if it's valid JSON data
-          rescue
-            # never mind, using standard text data instead
-          end
-        rescue => ex
-          raise "Error fetching remote file: #{ex}"
-        end
-        
-        items = response["items"]
-        
-        if items.count == 0 && params[:allow_empty_changelog] == false
+        if issues.count == 0 && params[:allow_empty_changelog] == false
           raise "No closed issues found for #{params[:milestone]} in #{params[:github_owner]}/#{params[:github_repository]}".red
         end
 
         labels = [params[:added_label_name], params[:updated_label_name], params[:changed_label_name], params[:fixed_label_name], params[:removed_label_name]]
         sections = Array.new
         labels.each do |label_name|
-          subitems = items.select {|item| item["labels"].any? {|label| label["name"].downcase == label_name.downcase}}
-          if subitems.count > 0
-            sections << {section: label_name, items: subitems}
-            items = items - subitems
+          subissues = issues.select {|issue| issue["labels"].any? {|label| label["name"].downcase == label_name.downcase}}
+          if subissues.count > 0
+            sections << {section: label_name, issues: subissues}
+            issues = issues - subissues
           end
         end
 
-        if items.count > 0
+        if issues.count > 0
           if sections.count > 0
             section_label = "Additional Changes"
           else
             section_label = "Changes"
           end
-          sections << {section: section_label, items: items}
+          sections << {section: section_label, issues: issues}
         end
         
         
@@ -70,7 +130,7 @@ module Fastlane
         
         result[:changelog] = "\n"
         sections.each do |section|
-          result[:changelog] << markdown_for_changelog_section(section[:section], section[:items])
+          result[:changelog] << markdown_for_changelog_section(params[:github_owner], params[:github_repository], params[:api_token], section[:section], section[:issues])
         end
         Actions.lane_context[SharedValues::GITHUB_MILESTONE_CHANGELOG] = result
         
@@ -100,6 +160,11 @@ module Fastlane
                                        env_name: "GITHUB_REPOSITORY",
                                        description: "Github Repository containing the milestone",
                                        is_string: true),
+          FastlaneCore::ConfigItem.new(key: :api_token,
+                                       env_name: "GITHUB_API_TOKEN",
+                                       description: "Personal API Token for GitHub - generate one at https://github.com/settings/tokens",
+                                       is_string: true,
+                                       optional: true),
           FastlaneCore::ConfigItem.new(key: :milestone,
                                        env_name: "FL_GENERATE_GITHUB_MILESTONE_CHANGELOG_MILESTONE",
                                        description: "Milestone to generate changelog notes",
